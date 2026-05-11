@@ -1,5 +1,7 @@
-// vice::features::turnlights — universal turn-signal lights for all vehicles.
-// Originally by Den_spb (plugin-sdk samples), adapted into the modular layout.
+// vice::features::turnlights — universal turn-signal lights with SA:MP 0.3DL sync.
+// Local rendering originally adapted from plugin-sdk samples (Den_spb, DK22Pac).
+// Network sync hijacks the trailing bits of outgoing InCarSync (ID 200) and
+// reads them back on the receive side — no server cooperation needed.
 
 #include "plugin.h"
 #include "CVehicle.h"
@@ -12,17 +14,34 @@
 #include "CPathFind.h"
 #include "CPools.h"
 
+#include "RakHook/rakhook.hpp"
+#include "RakNet/BitStream.h"
+
+#include <windows.h>
+
+#include <array>
+#include <atomic>
+
 using namespace plugin;
 
 namespace vice::features::turnlights {
 
 namespace {
 
-constexpr unsigned int kBlinkPeriodMs = 500;
+// ---- rendering knobs ------------------------------------------------------
+constexpr unsigned int kBlinkPeriodMs    = 500;
 constexpr float        kVisibilityRadius = 200.0f;
 
+// ---- wire-format trailer --------------------------------------------------
+// Outgoing InCarSync (ID 200) gets `[0xAB, state_byte]` appended at the end.
+// 0xAB is just a magic so we never mis-decode a vanilla packet (no false
+// positives from clients without the asi). The server forwards the bitstream
+// to peers; the trailer rides along intact in practice on 0.3DL.
+constexpr unsigned char kIncarSyncId  = 200;
+constexpr unsigned char kTrailerMagic = 0xAB;
+
 enum class light_state : unsigned char {
-    off, left, right, both
+    off = 0, left = 1, right = 2, both = 3
 };
 
 class state_store {
@@ -31,6 +50,19 @@ public:
     light_state value;
 };
 
+// ---- local + remote state -------------------------------------------------
+std::atomic<unsigned char> g_local_state{static_cast<unsigned char>(light_state::off)};
+
+struct remote_entry {
+    DWORD       last_seen_ms = 0;
+    light_state state        = light_state::off;
+};
+// SA:MP 0.3DL caps the player pool at 1004; one slot per id is cheap.
+std::array<remote_entry, 1005> g_remote{};
+
+constexpr DWORD kRemoteTtlMs = 1200;
+
+// ---- shared helpers (rendering side) --------------------------------------
 CVector2D path_link_position(CCarPathLinkAddress &address) {
     if (address.m_nAreaId != -1 && address.m_nCarPathLinkId != -1 && ThePaths.m_pPathNodes[address.m_nAreaId]) {
         const auto &node = ThePaths.m_pNaviNodes[address.m_nAreaId][address.m_nCarPathLinkId];
@@ -80,12 +112,12 @@ bool eligible(CVehicle *v) {
     return v->bEngineOn && v->m_fHealth > 0 && !v->bIsDrowning && !v->m_pAttachedTo;
 }
 
-light_state choose_for_player(CVehicle *) {
-    if (KeyPressed('Z'))           return light_state::left;
-    if (KeyPressed('X'))           return light_state::both;
-    if (KeyPressed('C'))           return light_state::right;
-    if (KeyPressed(VK_SHIFT))      return light_state::off;
-    return light_state::off; // caller keeps previous value when "no change"
+light_state choose_for_player() {
+    if (KeyPressed('Z'))      return light_state::left;
+    if (KeyPressed('X'))      return light_state::both;
+    if (KeyPressed('C'))      return light_state::right;
+    if (KeyPressed(VK_SHIFT)) return light_state::off;
+    return light_state::off; // caller decides whether to apply.
 }
 
 light_state choose_for_ai(CVehicle *v) {
@@ -112,24 +144,46 @@ bool blink_phase_on() {
     return CTimer::m_snTimeInMilliseconds % (kBlinkPeriodMs * 2) < kBlinkPeriodMs;
 }
 
+// Returns the most-recent unexpired remote entry. Used as a single-source
+// attribution for remote drivers (good enough when ≤1 remote driver visible —
+// the common 1-vs-1 case). Multi-driver attribution requires SA:MP pool
+// internals; planned for a follow-up.
+light_state newest_remote_state() {
+    const DWORD now = GetTickCount();
+    DWORD       best_age = kRemoteTtlMs;
+    light_state best     = light_state::off;
+    for (const auto &e : g_remote) {
+        if (e.last_seen_ms == 0) continue;
+        const DWORD age = now - e.last_seen_ms;
+        if (age < best_age) {
+            best_age = age;
+            best     = e.state;
+        }
+    }
+    return best;
+}
+
 VehicleExtendedData<state_store> g_store;
 
 void on_vehicle_render(CVehicle *v) {
-    if (!v || !CPools::ms_pVehiclePool)
-        return;
-    if (!eligible(v)) return;
+    if (!v || !CPools::ms_pVehiclePool) return;
+    if (!eligible(v))                    return;
 
     auto &state = g_store.Get(v).value;
+
     if (v->m_pDriver) {
         CPed *playa = FindPlayerPed();
         const bool player_drives = playa && playa->m_pVehicle == v && playa->bInVehicle;
         if (player_drives) {
-            const auto picked = choose_for_player(v);
-            // Player input: any keypress wins; otherwise keep previous state.
+            const auto picked = choose_for_player();
             if (picked != light_state::off || KeyPressed(VK_SHIFT))
                 state = picked;
+            g_local_state.store(static_cast<unsigned char>(state), std::memory_order_relaxed);
         } else {
-            state = choose_for_ai(v);
+            // Remote driver: take the newest remote-sync entry (within TTL),
+            // fall back to AI-derived guess from path nodes if nothing fresh.
+            const auto sync = newest_remote_state();
+            state = (sync != light_state::off) ? sync : choose_for_ai(v);
         }
     }
 
@@ -142,10 +196,40 @@ void on_vehicle_render(CVehicle *v) {
         draw_for(v->m_pTractor, state);
 }
 
+// ---- network: outgoing InCarSync ----------------------------------------
+bool on_send_packet(RakNet::BitStream *bs, PacketPriority &, PacketReliability &, char &) {
+    if (!bs || bs->GetNumberOfBytesUsed() < 1)            return true;
+    if (bs->GetData()[0] != kIncarSyncId)                 return true;
+
+    bs->SetWriteOffset(static_cast<int>(bs->GetNumberOfBitsUsed()));
+    bs->Write<unsigned char>(kTrailerMagic);
+    bs->Write<unsigned char>(g_local_state.load(std::memory_order_relaxed));
+    return true;
+}
+
+bool on_receive_packet(Packet *p) {
+    if (!p || p->length < 4)                              return true;
+    if (p->data[0] != kIncarSyncId)                       return true;
+    if (p->data[p->length - 2] != kTrailerMagic)          return true;
+
+    const unsigned char raw = p->data[p->length - 1];
+    if (raw > static_cast<unsigned char>(light_state::both)) return true;
+
+    // Relayed InCarSync layout from server: [id][senderId_word][...sync...]
+    const unsigned short sender_id = *reinterpret_cast<const unsigned short *>(p->data + 1);
+    if (sender_id >= g_remote.size())                     return true;
+
+    g_remote[sender_id].state        = static_cast<light_state>(raw);
+    g_remote[sender_id].last_seen_ms = GetTickCount();
+    return true;
+}
+
 class installer {
 public:
     installer() {
         Events::vehicleRenderEvent.before += on_vehicle_render;
+        rakhook::on_send_packet           += on_send_packet;
+        rakhook::on_receive_packet        += on_receive_packet;
     }
 } g_installer;
 
