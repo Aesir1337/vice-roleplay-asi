@@ -13,6 +13,7 @@
 #include "CCamera.h"
 #include "CPathFind.h"
 #include "CPools.h"
+#include "ePedType.h"
 
 #include "RakHook/rakhook.hpp"
 #include "RakNet/BitStream.h"
@@ -21,6 +22,7 @@
 
 #include <array>
 #include <atomic>
+#include <optional>
 
 using namespace plugin;
 
@@ -144,14 +146,15 @@ bool blink_phase_on() {
     return CTimer::m_snTimeInMilliseconds % (kBlinkPeriodMs * 2) < kBlinkPeriodMs;
 }
 
-// Returns the most-recent unexpired remote entry. Used as a single-source
-// attribution for remote drivers (good enough when ≤1 remote driver visible —
-// the common 1-vs-1 case). Multi-driver attribution requires SA:MP pool
-// internals; planned for a follow-up.
-light_state newest_remote_state() {
-    const DWORD now = GetTickCount();
+// Returns the freshest (newest, within TTL) remote-sync entry, including
+// `off`. Empty optional means "no recent sync from anyone" — caller decides
+// whether to fall back further. Single-source attribution: good enough while
+// at most one remote driver is visible. Multi-driver attribution needs the
+// SA:MP CPlayerPool offsets for 0.3DL — planned for a follow-up.
+std::optional<light_state> freshest_remote_within_ttl() {
+    const DWORD now      = GetTickCount();
     DWORD       best_age = kRemoteTtlMs;
-    light_state best     = light_state::off;
+    std::optional<light_state> best;
     for (const auto &e : g_remote) {
         if (e.last_seen_ms == 0) continue;
         const DWORD age = now - e.last_seen_ms;
@@ -172,18 +175,23 @@ void on_vehicle_render(CVehicle *v) {
     auto &state = g_store.Get(v).value;
 
     if (v->m_pDriver) {
-        CPed *playa = FindPlayerPed();
+        CPed      *playa         = FindPlayerPed();
         const bool player_drives = playa && playa->m_pVehicle == v && playa->bInVehicle;
         if (player_drives) {
             const auto picked = choose_for_player();
             if (picked != light_state::off || KeyPressed(VK_SHIFT))
                 state = picked;
             g_local_state.store(static_cast<unsigned char>(state), std::memory_order_relaxed);
+        } else if (v->m_pDriver->m_nPedType <= PED_TYPE_PLAYER_UNUSED) {
+            // Another player: trust the wire-synced state — even when it's
+            // OFF. The path-node AI heuristic doesn't apply to remote players
+            // (their m_autoPilot fields aren't populated → garbage in, lefts
+            // out).
+            const auto fresh = freshest_remote_within_ttl();
+            state = fresh.value_or(light_state::off);
         } else {
-            // Remote driver: take the newest remote-sync entry (within TTL),
-            // fall back to AI-derived guess from path nodes if nothing fresh.
-            const auto sync = newest_remote_state();
-            state = (sync != light_state::off) ? sync : choose_for_ai(v);
+            // Real game AI driver — original path-node heuristic stays useful.
+            state = choose_for_ai(v);
         }
     }
 
