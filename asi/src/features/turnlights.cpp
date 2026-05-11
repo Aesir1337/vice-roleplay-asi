@@ -10,6 +10,7 @@
 #include "CGeneral.h"
 #include "CCamera.h"
 #include "CPathFind.h"
+#include "CPools.h"
 
 using namespace plugin;
 
@@ -111,11 +112,14 @@ bool blink_phase_on() {
     return CTimer::m_snTimeInMilliseconds % (kBlinkPeriodMs * 2) < kBlinkPeriodMs;
 }
 
+VehicleExtendedData<state_store> g_store;
+
 void on_vehicle_render(CVehicle *v) {
-    static VehicleExtendedData<state_store> store;
+    if (!v || !CPools::ms_pVehiclePool)
+        return;
     if (!eligible(v)) return;
 
-    auto &state = store.Get(v).value;
+    auto &state = g_store.Get(v).value;
     if (v->m_pDriver) {
         CPed *playa = FindPlayerPed();
         const bool player_drives = playa && playa->m_pVehicle == v && playa->bInVehicle;
