@@ -27,7 +27,9 @@ asi/
     plugin.hpp             vice::plugin::install/shutdown
     hooks.hpp              vice::hooks::install/uninstall
     actions.hpp            vice::actions::*
+    game.hpp               vice::game::* (GTA SA helpers)
     bitstream_utils.hpp    vice::utils::*
+  src/features/            izole oyun-özelliği modülleri (vice::features::*)
   src/
     dllmain.cpp            DllMain — sadece plugin::install/shutdown çağırır
     plugin.cpp             Bootstrap: samp_version kontrolü → hooks::install
@@ -145,6 +147,12 @@ Yeni bağımlılık eklenmeden önce:
 Mevcut bağımlılıklar (`src/CMakeLists.txt` üzerinden):
 - `cyanide` (hook abstraction)
 - `polyhook2` + asmjit + asmtk + zydis (detour engine)
+
+Opsiyonel (varsayılan ON, `cmake/plugin-sdk.cmake`):
+- `DK22Pac/plugin-sdk` (Zlib) — GTA SA sınıfları & event sistemi.
+  - **Lib build'i tam değil:** sadece bir avuç shared + game_sa cpp'si (Pattern, PluginBase, CMessages, CWorld, CVehicle, vb.) `plugin_sdk_core` static lib'i içinde compile edilir. Geri kalan header'lar inline çağrılarla GTA SA adreslerine bağlanır — `vice::features::*` modülleri eklerken yeni link hatası çıkarsa `cmake/plugin-sdk.cmake` `PLUGIN_SDK_CORE_SOURCES` listesine ilgili `.cpp`'yi ekle.
+  - **RenderWare SDK gerekir.** `RWGSDK` env var, `RWGDIR` env var, veya `-DVICEASI_RW_SDK_ROOT=<path>` ile bulunur. plugin-sdk RW define edilmiş şekilde derlenir; RW header yolu (varsayılan `d3d9`) `VICEASI_RW_PLATFORM` ile değiştirilebilir.
+  - `vice::features::*` kodu plugin-sdk sınıflarını **`.cpp` içinde** kullanabilir; public header'larda (`asi/include/viceasi/*.hpp`) plugin-sdk include'u **yasak** — wrapper API saf C++ kalır.
 
 ---
 

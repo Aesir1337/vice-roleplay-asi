@@ -1,5 +1,6 @@
 #include "viceasi/actions.hpp"
 #include "viceasi/bitstream_utils.hpp"
+#include "viceasi/game.hpp"
 
 #include "RakHook/rakhook.hpp"
 #include "RakNet/BitStream.h"
@@ -18,6 +19,7 @@ void change_name() {
     rpc.Write<unsigned char>(1);
 
     rakhook::emul_rpc(RPC_SET_PLAYER_NAME, rpc);
+    game::hud_message("vice: name changed");
 }
 
 void emul_player_sync() {
@@ -40,6 +42,7 @@ void emul_player_sync() {
     bs.Write0();
 
     rakhook::emul_packet(bs);
+    game::hud_message("vice: player_sync emulated");
 }
 
 } // namespace vice::actions

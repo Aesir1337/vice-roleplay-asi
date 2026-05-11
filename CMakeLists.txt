@@ -10,8 +10,13 @@ endif ()
 
 option(RAKHOOK_INSTALL "Install targets" ${RAKHOOK_MASTER_PROJECT})
 option(VICEASI_BUILD_ASI "Build the vice-roleplay.asi plugin" ${RAKHOOK_MASTER_PROJECT})
+option(VICEASI_USE_PLUGIN_SDK "Link against DK22Pac/plugin-sdk for GTA SA helpers" ${RAKHOOK_MASTER_PROJECT})
 
 add_subdirectory(src)
+
+if (VICEASI_USE_PLUGIN_SDK)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/plugin-sdk.cmake)
+endif ()
 
 if (RAKHOOK_INSTALL)
     include(GNUInstallDirs)
